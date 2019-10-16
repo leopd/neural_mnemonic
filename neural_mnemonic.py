@@ -25,7 +25,7 @@ CODE = {
     4: ['r'],
     5: ['l', 'll'],
     6: ['sh', 'ch', 'j', 'dg'],
-    7: ['c', 'k', 'ck'],
+    7: ['g', 'c', 'k', 'ck'],
     8: ['f', 'v', 'ph'],
     9: ['b', 'p'],
     None: ['a','e','i','o','u','w','y',' ', ''],
@@ -193,7 +193,9 @@ def recommended_search(numbers:str, max_out:int=100, beam_size:int=500, non_nume
     return out
 
 
-def check_number_string(numbers:str) -> str:
+def numberstr(numbers:str) -> str:
+    """Validator/constructor for argparse that confirms a string only has numbers in it.
+    """
     for digit in numbers:
         if digit not in "0123456789":
             raise argparse.ArgumentTypeError("Please only include digits 0-9 without punctuation")
@@ -202,7 +204,7 @@ def check_number_string(numbers:str) -> str:
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('numbers', 
-        type=check_number_string, 
+        type=numberstr, 
         help='The sequence of numbers to find a phrase for')
     parser.add_argument('-b', '--beam_size',
         type=int,
