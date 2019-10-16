@@ -1,4 +1,4 @@
 torch
+tqdm
 transformers
-nltk
 pytest

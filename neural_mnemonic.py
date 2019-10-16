@@ -1,196 +1,18 @@
 """Find phrases corresponding to numbers using the Major mnemonic system.
-Uses GPT2 neural transformer language model to evaluate the quality of phrases,
-along with NLTK corpus to validate word correctness.
-
-Considerably faster with a CUDA GPU.  Increasing beam_size will increase 
-quality of results, but also increase time.  
-Setting non_numeric_count>1 increases search time dramatically.
+Uses GPT2 neural transformer language model to evaluate the quality of phrases.
+Phrases are generated using the most popular words for each pronunciation,
+as translated by the CMU US English Dictionary.
 """
 
 import argparse
+import heapq
+import json
 import functools
+import random
 import torch
-from nltk.corpus import words
-import numpy as np
 from tqdm.auto import tqdm
-import transformers
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
-
-
-CODE = {
-    0: ['s', 'z', 'ss'],
-    1: ['t', 'tt', 'd', 'th'],
-    2: ['n'],
-    3: ['m'],
-    4: ['r'],
-    5: ['l', 'll'],
-    6: ['sh', 'ch', 'j', 'dg'],
-    7: ['g', 'c', 'k', 'ck'],
-    8: ['f', 'v', 'ph'],
-    9: ['b', 'p'],
-    None: ['a','e','i','o','u','w','y',' ', ''],
-}
-#NOTE: this is intrinsically approximate/flawed because of English's irregular spelling.
-
-class SentenceScorer():
-    """Computes a language model score for a sentence.
-    """
-
-    def __init__(self, model_name:str='gpt2', expand:int=2):
-        self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-        self.model = GPT2LMHeadModel.from_pretrained(model_name)
-        if torch.cuda.is_available():
-            self._cuda = True
-            self.model.cuda()
-        else:
-            self._cuda = False
-        self.model.eval()
-
-    @functools.lru_cache(maxsize=10000000)
-    def perplexity(self, text:str) -> float:
-        """Returns perplexity of a sentence.  Lower is better.
-        """
-        # Based on https://github.com/huggingface/transformers/issues/1009
-        input_ids = torch.tensor(self.tokenizer.encode(text)).unsqueeze(0)  # Batch size 1
-        tokenize_input = self.tokenizer.tokenize(text)
-        #50256 is the token_id for <|endoftext|>
-        tensor_input = torch.tensor([ [50256]  +  self.tokenizer.convert_tokens_to_ids(tokenize_input)])
-        with torch.no_grad():
-            if self._cuda:
-                tensor_input = tensor_input.to('cuda')
-            outputs = self.model(tensor_input, labels=tensor_input)
-            loss, logits = outputs[:2]
-        return float(loss)*len(tokenize_input)
-
-    def __call__(self, text:str) -> float:
-        #return self.perplexity(text) / len(text.split())
-        return self.perplexity(text)
-
-class NltkWordScorer():
-    """Just says if each word is a word or not, using nltk corpus.
-    Sentence score is the fraction of words that are in the corpus.
-    For the final word in the sentence, it allows partial words -- that
-    is word prefixes that could be completed into full words like "transpor"
-    """
-
-    def __init__(self):
-        self._vocab = set(words.words())
-        self._prefixes = set()
-        for word in self._vocab:
-            for i in range(len(word)):
-                sub = word[:i]
-                self._prefixes.add(sub)
-
-    @functools.lru_cache(maxsize=10000000)
-    def __call__(self, text:str) -> float:
-        words = text.split()
-        bad = 0
-        refset = self._prefixes  
-        for word in words[::-1]:  # go backwards
-            if not word in refset:
-                bad += 1
-            refset = self._vocab  # last word is checked against prefixes, rest against vocab
-        return bad / len(words)
-
-
-class CompositeScorer():
-
-    def __init__(self, word_scorer, backup_scorer, factor:float=100):
-        self._word = word_scorer
-        self._backup = backup_scorer
-        self.factor = factor
-
-    @functools.lru_cache(maxsize=10000000)
-    def __call__(self, text:str) -> float:
-        base = self._word(text)
-        if base == 0:
-            full_score = self._backup(text)
-            # Since last word could be incomplete, see what the big scorer says without it.
-            all_but_last_word = ' '.join(text.split()[:-1]) + '.'
-            all_but_score = self._backup(all_but_last_word) 
-            return (full_score + all_but_score) / self.factor
-        else:
-            return base * self.factor
-
-
-class BeamSearcher():
-
-    def __init__(self, scorer:SentenceScorer, beam_size:int, expand_cnt:int=2):
-        self.scorer = scorer
-        self.beam = beam_size
-        self._candidates = []
-        self.EXPANDED_CODE = {}
-        for d in range(10):
-            self.EXPANDED_CODE[d] = self._expand_code_nones(d, cnt_nones=expand_cnt)
-
-
-    def _expand_code1(self, digit:int, base:[str]=['']) -> [str]:
-        out = []
-        for c in CODE[digit]:
-            for b in base:
-                out.append(b+c)
-        return out
-
-    def _expand_code_nones(self, digit:int, base:[str]=[''], cnt_nones:int=2) -> [str]:
-        out = base
-        for _ in range(cnt_nones):
-            out = self._expand_code1(None, out)
-        out = self._expand_code1(digit, out)
-        for _ in range(cnt_nones):
-            out = self._expand_code1(None, out)
-        return list(set(out))
-
-    def convert(self, digits:str, max_out:int=100) -> [str]:
-        """Converts a string of digits to the most likely sentence.
-        """
-        self._candidates = ['']
-        for i, digit in enumerate(digits):
-            sub = digits[:(i+1)]
-            print(f"Adding digit {digit} up to {sub}")
-            d = int(digit)
-            self._next_digit(d)
-            self._beam_down()
-            print(f"Best so far for {sub}... {self._candidates[:10]}")
-            print(f"Worst is number {len(self._candidates)}: '{self._candidates[-1]}' with score {self.scorer(self._candidates[-1]):.4f}")
-        return self._candidates[:max_out]
-
-    def _next_digit(self, digit:int):
-        next_set = []
-        for base in tqdm(self._candidates, "generating candidates"):
-            next_set += self._expand_possibilities(base, digit)
-        self._candidates = self._condense_list(next_set)
-
-    def _condense_list(self, candidates:[str]) -> [str]:
-        print(f"Deduplicating set of {len(candidates)}")
-        deduped = set(candidates)
-        round2 = set()
-        for s in deduped:
-            s = s.strip()
-            s = s.replace("  "," ")
-            round2.add(s)
-        print(f"Deduplicated down to {len(round2)}")
-        return list(round2)
-
-    def _beam_down(self):
-        scores = {}
-        for candidate in tqdm(self._candidates, "scoring"):
-            scores[candidate] = self.scorer(candidate)
-        print("Sorting...")
-        ordered = sorted(scores.items(), key=lambda kv: kv[1])
-        self._candidates = [kv[0] for kv in ordered[:self.beam]]
-
-    def _expand_possibilities(self, base:str, digit:int) -> [str]:
-        out = [base + ec for ec in self.EXPANDED_CODE[digit]]
-        return out
-
-
-def recommended_search(numbers:str, max_out:int=100, beam_size:int=500, non_numeric_count:int=1, gpt:str='distilgpt2'):
-    fancy = SentenceScorer(gpt)
-    cheap = NltkWordScorer()
-    both = CompositeScorer(cheap, fancy)
-    bs = BeamSearcher(both, beam_size=beam_size, expand_cnt=non_numeric_count)
-    out = bs.convert(numbers, max_out=max_out)
-    return out
+from typing import List, Tuple
 
 
 def numberstr(numbers:str) -> str:
@@ -201,6 +23,253 @@ def numberstr(numbers:str) -> str:
             raise argparse.ArgumentTypeError("Please only include digits 0-9 without punctuation")
     return numbers
 
+
+class NextBeamDataset(torch.utils.data.IterableDataset):
+    """An iterable dataset meant to be used only once, which generates all the
+    candidates for the next beam.
+
+    Pattern of use should be: iterate over it with a DataLoader, score the results,
+    and then call register_beam_winners.
+    """
+
+    def __init__(self, numbers:str, mnd:dict, blank_vocab:int=0):
+        self.beam = [('', numbers)]
+        self.next_beam = []
+        self.mnd = mnd
+        self.longest_num = max(set([len(nums) for nums in self.mnd.keys()]))
+        self.blank_vocab = blank_vocab
+
+    def longest_left(self) -> int:
+        numbers_length = set()
+        for words_so_far, digits_to_go in self.beam:
+            numbers_length.add(len(digits_to_go))
+        return max(numbers_length)
+
+    def __iter__(self):
+        """Goes through the current beam, and yields a new set of candidates.
+        Ones which are ahead, we store for the next epoch.
+        Yields dicts with 2 keys: 'phrase', 'numtogo'
+        """
+        # First, count how far they are.  Only candidates the furthest behind get to advance.
+        target_length = self.longest_left()
+        if target_length == 0:
+            print("Nothing left to do!")
+            return
+        print(f"This time, we're targeting {target_length} length sequences")
+
+        # Now start to generate the next set of candidates
+        next_beam = set()
+        self.carry_forward = []
+        for words_so_far, digits_to_go in self.beam:
+            if not len(digits_to_go) == target_length:
+                self.carry_forward.append((words_so_far, digits_to_go))
+            else:
+                if digits_to_go:
+                    # This one needs to be expanded.
+                    yield from self._expand_candidate(words_so_far, digits_to_go, self.blank_vocab)
+        print(f"Carried forward {len(self.carry_forward)} shorter entries")
+
+    def _expand_candidate(self, words_so_far:str, digits_to_go:str, blank_vocab:int):
+        """Yields a set of beam-entries to evaluate.
+        """
+        if blank_vocab:
+            # Recurse to add all the possible blank words
+            for blank_word in self.mnd[''][:blank_vocab]:
+                new_phrase = words_so_far + " " + blank_word
+                yield from self._expand_candidate(new_phrase, digits_to_go, 0)
+            # pass through to allow non-blanks as well
+
+        # Now consume as many digits_to_go as possible, down to 1
+        max_digits = min(self.longest_num, len(digits_to_go))
+        assert max_digits > 0  # something's wrong
+        for dig_length in range(max_digits,0,-1):
+            numbers_to_convert = digits_to_go[:dig_length]
+            new_digits_to_go = digits_to_go[dig_length:]
+            if not numbers_to_convert in self.mnd:
+                # This set of numbers doesn't have any valid words in the vocab.
+                continue
+            if new_digits_to_go:
+                suffix = ''
+            else:
+                # This one is at the end.  Treat it like a complete sentence.
+                suffix = '.'
+            for word in self.mnd[numbers_to_convert]:
+                yield {
+                    'phrase': words_so_far + " " + word + suffix,
+                    'numtogo': new_digits_to_go,
+                }
+
+    def register_beam_winners(self, winners:list):
+        """Records the winning candidates from the last epoch, to make
+        the foundation for the next.  This also carries forward everything
+        from the last epoch which wasn't explicitly evaluated
+        """
+        self.beam = self.carry_forward
+        for phrase, numbers in winners:
+            assert isinstance(phrase,str)
+            assert isinstance(numberstr(numbers),str)
+            self.beam.append((phrase, numbers))
+
+
+class SentenceScorer():
+    """Computes a language model score for a sentence.
+    """
+
+    def __init__(self, model_name:str='distilgpt2'):
+        self.model = GPT2LMHeadModel.from_pretrained(model_name)
+        if torch.cuda.is_available():
+            self._cuda = True
+            self.model.cuda()
+        else:
+            self._cuda = False
+        self.model.eval()
+
+        self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+        self.eos = self.tokenizer.encode(self.tokenizer.special_tokens_map['eos_token'])
+
+
+    @functools.lru_cache(maxsize=10000000)
+    def perplexity(self, text:str) -> float:
+        """Returns perplexity of a sentence.  Lower is better.
+        """
+        # Based on https://github.com/huggingface/transformers/issues/1009
+        tokens = self.tokenizer.tokenize(text)
+        tensor_input = torch.tensor([self.eos + self.tokenizer.encode(tokens)])
+        with torch.no_grad():
+            if self._cuda:
+                tensor_input = tensor_input.to('cuda')
+            outputs = self.model(tensor_input, labels=tensor_input)
+            loss, logits = outputs[:2]
+        return float(loss)*len(tokens)  # total perplexity
+        #return float(loss)  # per-token perplexity, favors unusual words with lots of tokens. 
+        # e.g. when using per-token perplexity, every 3 wants to be "Yamaha".
+
+    def __call__(self, text:str) -> float:
+        return self.perplexity(text)
+
+
+class BestHeap():
+    """Remembers the best (lowest) N scores seen so far.
+    Uses a max-heap so the worst score (largest number) can always be removed quickly.
+    (Since python implements min-heap by default, we have to invert the score internally.)
+
+    Restores numbers to their original value when you iterate over them.
+    """
+
+    def __init__(self, size:int):
+        self.h = []
+        self.size = size
+
+    def add(self, entry, score):
+        # add some float64 noise to avoid sorting collisions, since the "entry" is typically a dict, which
+        # python can't compare.
+        fuzzed_score = float(score) * (1 + 1e-8 * random.random())  
+        heapitem = (-fuzzed_score, entry)
+        if len(self.h) < self.size:
+            heapq.heappush(self.h, heapitem)
+        else:
+            heapq.heappushpop(self.h, heapitem)
+
+    def flush(self) -> List[Tuple[str, float]]:
+        """Empties the heap, and returns the contents in order.
+        """
+        out = []
+        while self.h:
+            negscore, entry = heapq.heappop(self.h)
+            out.insert(0, (entry, -negscore))
+        return out
+
+
+
+class BeamSearcher():
+
+    def __init__(self, numbers:str, mnd:dict, beam_size:int, scorer:SentenceScorer, word_penalty:float, 
+                 char_penalty:float, blank_vocab:int=0):
+        self.numbers = numbers
+        self.total_len = len(numbers)
+        assert self.total_len > 0
+        self.scorer = scorer
+        self.data = NextBeamDataset(numbers, mnd, blank_vocab)
+        self.beam_size = beam_size
+        self.winners = None
+        self.word_penalty = word_penalty
+        self.char_penalty = char_penalty
+
+    def do_beam(self):
+        best = BestHeap(self.beam_size)
+        print("Generating candidates")
+        candidates = list(self.data)
+        for candidate in tqdm(candidates, "scoring"):
+            score = self.calc_score(candidate)
+            best.add(candidate, score)
+        self.winners = best.flush()
+        winners_without_scores = [(rec['phrase'], rec['numtogo']) for rec, score in self.winners]
+        self.data.register_beam_winners(winners_without_scores)
+
+    def calc_score(self, candidate:dict) -> float:
+        raw_score = self.scorer(candidate['phrase'])
+        numbers_used = self.total_len - len(candidate['numtogo'])
+        raw_score /= numbers_used  # perplexity goes up by length, so normalize to the fraction of the way through the problem
+        word_cnt = len(candidate['phrase'].split())
+        score = raw_score * (word_cnt ** self.word_penalty)
+        char_cnt = len(candidate['phrase'])
+        score *= (char_cnt ** self.char_penalty)
+        return score
+
+    def run(self, max_out:int=100):
+        while self.data.longest_left() > 0:
+            self.do_beam()
+            self.summarize_results()
+        out = self.final_scores(max_out)
+        return out
+
+    def final_scores(self, max_out:int):
+        phrases = set()
+        for rec, score in self.winners:
+            phrases.add(rec['phrase'])
+        for phrase, numbers in self.data.beam:
+            phrases.add(phrase)
+        best = BestHeap(self.beam_size)
+        for phrase in phrases:
+            phrase = phrase.strip()
+            score = self.scorer(phrase) 
+            best.add(phrase, score)
+        print("\nFinal results...")
+        final_results = list(best.flush())
+        out = []
+        for phrase, score in final_results[:max_out]:
+            print(f"{score: 8.2f} {phrase}")
+            out.append(phrase)
+        return out
+
+    def summarize_results(self):
+        print("This round:")
+        for rec, score in self.winners[:10]:
+            print(f"{score: 8.2f} {rec['phrase']}")
+
+def shrink_dict(mnemonic_dict:dict, vocab_limit:int) -> dict:
+    """Takes a dict which maps numberstr -> List[word-strings], and
+    limits each value so that it has at most vocab_limit entries.  If the dict
+    is sorted (like the one on disk is), this keeps the most common words.
+    """
+    out = {}
+    for numbers, wordlist in mnemonic_dict.items():
+        if wordlist:
+            out[numbers] = wordlist[:vocab_limit]
+    return out
+        
+
+def recommended_search(numbers:str, max_out:int=100, gpt:str='distilgpt2', beam_size:int=50, 
+                       vocab_limit:int=20, blank_vocab:int=0, word_penalty:float=0.3, 
+                       char_penalty:float=0):
+    scorer = SentenceScorer(gpt)
+    mnemonic_dict = json.load(open("mnemonic-dict.json","rt"))
+    reduced_dict = shrink_dict(mnemonic_dict, vocab_limit)
+    bs = BeamSearcher(numbers, reduced_dict,  beam_size, scorer, word_penalty, char_penalty, blank_vocab)
+    out = bs.run(max_out=max_out)
+    return out
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('numbers', 
@@ -208,12 +277,24 @@ def parse_args():
         help='The sequence of numbers to find a phrase for')
     parser.add_argument('-b', '--beam_size',
         type=int,
-        default=500,
-        help='Number of phrases to keep in the beam search')
-    parser.add_argument('-nn', '--non_numeric_count',
+        default=20,
+        help='Number of phrases to keep in the beam search. Larger is slower, better.')
+    parser.add_argument('-wp', '--word_penalty',
+        type=float,
+        default=0.5,
+        help='How much to discourage phrases with lots of words. Try -1ish to 1ish. Larger means shorter phrases.')
+    parser.add_argument('-cp', '--char_penalty',
+        type=float,
+        default=0.1,
+        help='How much to discourage phrases with lots of characters. Try -1ish to 1ish. Larger means shorter phrases.')
+    parser.add_argument('-v', '--vocab_limit',
+        type=int,
+        default=25,
+        help='Max number of words to consider for each number combination. Larger is slower, better.')
+    parser.add_argument('-bv', '--blank_vocab',
         type=int,
         default=1,
-        help='Number of non-mnemonic characters to try before and after each number')
+        help='How many "blank" words (like "a" which have no number) to consider between each numeric word. Can be 0, default 1, larger is significantly slower.')
     parser.add_argument('-mo', '--max_out',
         type=int,
         default=100,
@@ -224,10 +305,7 @@ def parse_args():
         help='Which pre-trained GPT2 model to use to judge phrase quality')
     return parser.parse_args()
 
+
 if __name__ == "__main__":
     args = parse_args()
-    out = recommended_search(args.numbers, args.max_out, args.beam_size, args.non_numeric_count, args.gpt)
-    print("Final results:\n")
-    for result in out:
-        print(result)
-    
+    recommended_search(**dict(args.__dict__))
