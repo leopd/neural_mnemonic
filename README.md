@@ -19,7 +19,7 @@ This will automatically download the GPT2 models as needed, and after another 30
 
 ```
 mother tulip
-moderate loob
+moderate loop
 meteor dolp
 ```
 
