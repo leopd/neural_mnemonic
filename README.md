@@ -1,10 +1,10 @@
 # Neural Number Mnemonic
 
-The [mnemonic major system](https://en.wikipedia.org/wiki/Mnemonic_major_system) is a way to remember long numbers by converting them to phrases.  This code uses a deep-learning language model (GPT2) to find meaningful phrases that correspond to number sequences.
+The [mnemonic major system](https://en.wikipedia.org/wiki/Mnemonic_major_system) is a way to remember long numbers by converting them to phrases.  This program uses a deep-learning language model (GPT2) to find meaningful phrases that correspond to number sequences.
 
-The basics of the code are that each number corresponds to a consonant sound, e.g. "3" corresponds to "M", "1" corresponds to "S" or "T" or "TH", and "4" corresponds to "R".  I learned about this system from one of my college math professors, [Dr. Arthur Benjamin](https://math.hmc.edu/benjamin/), who uses it to, among other things, remember intermediate results when performing "mathemagician" tricks like [multiplying 5-digit numbers in his head](https://www.ted.com/talks/arthur_benjamin_does_mathemagic?language=en#t-819057).  To dive into this, I highly recommend his book, [Secrets of Mental Math](https://www.amazon.com/Secrets-Mental-Math-Mathemagicians-Calculation/dp/0307338401).
+The basics of the mnemonic are that each number corresponds to a consonant sound, e.g. "3" corresponds to "M", "1" corresponds to "T" or "D" or "TH", and "4" corresponds to "R".  I learned about this system from one of my college math professors, [Dr. Arthur Benjamin](https://math.hmc.edu/benjamin/), who uses it to, among other things, remember intermediate results when performing "mathemagician" tricks like [multiplying 5-digit numbers in his head](https://www.ted.com/talks/arthur_benjamin_does_mathemagic?language=en#t-819057).  To dive into this, I highly recommend his book, [Secrets of Mental Math](https://www.amazon.com/Secrets-Mental-Math-Mathemagicians-Calculation/dp/0307338401).
 
-This code uses a neural-network transformer-based language model (GPT2) from [Huggingface](https://huggingface.co/transformers/) to discriminate between high-quality phrases and low-quality phrases that correspond to any number you provide.  A complete search over possibilities is exponentially expensive, so this uses beam-search to make the runtime linear, with many configurable parameters to trade-off how it searches.
+This program uses a neural-network transformer-based language model (GPT2) from [Huggingface](https://huggingface.co/transformers/) to discriminate between high-quality phrases and low-quality phrases that correspond to any number you provide.  A complete search over possibilities is exponentially expensive, so this uses beam-search to make the runtime linear, with many configurable parameters to trade-off how it searches.
 
 
 ## Usage
@@ -69,4 +69,3 @@ It's reasonably fast with a GPU, but result quality would benefit from further s
 
 The LRU cache on GPT2 evaluations provided by the `@functools.lru_cache` annotation can chew up gigabytes of memory (I'm guessing not a problem for most machines these days).  It probably doesn't help at all for single (command-line) runs, but can dramatically speed up repeated tinkering in a notebook -- very similar runs can be nearly instantaneous.  I should include an example of doing this.
 
-I'd like to add some diversity into the beam search candidates, perhaps following a technique like [Diverse Beam Search, Vijayakumar, et al 2016](https://arxiv.org/pdf/1610.02424.pdf), and expose controls to force it to dig into a particular beam candidate.  I'd also like to let it figure out where to end sentences, and explore multi-sentence phrases.

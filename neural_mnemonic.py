@@ -179,12 +179,27 @@ class BestHeap():
             out.insert(0, (entry, -negscore))
         return out
 
+@functools.lru_cache(maxsize=1000000)
+def words_for_doc(doc:str) -> set:
+    return set(doc.split())
+
+def document_similarity_score(doc1:str, doc2:str) -> float:
+    """Calculates a scaled jaccard similarity between documents based on words.
+    It is normalized to the average number of words per document, so it has units words.
+    """
+    words1 = set(doc1.split())
+    words2 = set(doc2.split())
+    both = words1.intersection(words2)
+    either = words1.union(words2)
+    jaccard = len(both) / len(either)
+    score = jaccard * (len(both) + len(either)) / 2
+    return score
 
 
 class BeamSearcher():
 
-    def __init__(self, numbers:str, mnd:dict, beam_size:int, scorer:SentenceScorer, word_penalty:float, 
-                 char_penalty:float, blank_vocab:int=0):
+    def __init__(self, numbers:str, mnd:dict, scorer:SentenceScorer, beam_size:int, word_penalty:float=0, 
+                 char_penalty:float=0, blank_vocab:int=0, diversity_penalty:float=10):
         self.numbers = numbers
         self.total_len = len(numbers)
         assert self.total_len > 0
@@ -194,25 +209,51 @@ class BeamSearcher():
         self.winners = None
         self.word_penalty = word_penalty
         self.char_penalty = char_penalty
+        self.diversity_penalty = diversity_penalty
+        self.beam_expansion = 50  # heuristic to decide how many candidates to keep for diversity
+
+    def diversity_filter(self, candidates:list) -> list:
+        """Strategy is to add a penalty for every higher-scoring doc that is similar.
+        Penalty is jaccard similarity * diversity_penalty for each previous similar doc.
+        """
+        if self.diversity_penalty:
+            out = BestHeap(self.beam_size)
+            phrases_so_far = []
+            for n, rec_score in enumerate(tqdm(candidates, "diversifying")):
+                rec, score = rec_score
+                total_penalty = 0
+                this_phrase = rec['phrase']
+                for compare_to in phrases_so_far:  # ugh N^2...
+                    similarity = document_similarity_score(this_phrase, compare_to)
+                    total_penalty += self.diversity_penalty * similarity
+                rec['base_score'] = score
+                rec['old_rank'] = n + 1
+                out.add(rec, score + total_penalty)
+                phrases_so_far.append(this_phrase)
+            return out.flush()
+        else:
+            return candidates[:self.beam_size]
 
     def do_beam(self):
-        best = BestHeap(self.beam_size)
+        best = BestHeap(self.beam_size * self.beam_expansion)  # heuristic to leave room for diversity
         print("Generating candidates")
+        #TODO: use a DataLoader to score in minibatches
         candidates = list(self.data)
         for candidate in tqdm(candidates, "scoring"):
             score = self.calc_score(candidate)
             best.add(candidate, score)
-        self.winners = best.flush()
+        self.winners = self.diversity_filter(best.flush())
         winners_without_scores = [(rec['phrase'], rec['numtogo']) for rec, score in self.winners]
         self.data.register_beam_winners(winners_without_scores)
 
     def calc_score(self, candidate:dict) -> float:
-        raw_score = self.scorer(candidate['phrase'])
+        phrase = candidate['phrase']
+        raw_score = self.scorer(phrase)
         numbers_used = self.total_len - len(candidate['numtogo'])
         raw_score /= numbers_used  # perplexity goes up by length, so normalize to the fraction of the way through the problem
-        word_cnt = len(candidate['phrase'].split())
+        word_cnt = len(phrase.split())
         score = raw_score * (word_cnt ** self.word_penalty)
-        char_cnt = len(candidate['phrase'])
+        char_cnt = len(phrase)
         score *= (char_cnt ** self.char_penalty)
         return score
 
@@ -234,6 +275,7 @@ class BeamSearcher():
             phrase = phrase.strip()
             score = self.scorer(phrase) 
             best.add(phrase, score)
+        #TODO: Add diversity here too.
         print("\nFinal results...")
         final_results = list(best.flush())
         out = []
@@ -244,8 +286,9 @@ class BeamSearcher():
 
     def summarize_results(self):
         print("This round:")
-        for rec, score in self.winners[:10]:
-            print(f"{score: 8.2f} {rec['phrase']}")
+        for rec, score in self.winners[:50]:
+            display_score = rec.get('base_score', score)
+            print(f"{display_score: 8.2f} (#{rec.get('old_rank','#'): 3d}) {rec['phrase']}")
 
 def shrink_dict(mnemonic_dict:dict, vocab_limit:int) -> dict:
     """Takes a dict which maps numberstr -> List[word-strings], and
@@ -259,13 +302,11 @@ def shrink_dict(mnemonic_dict:dict, vocab_limit:int) -> dict:
     return out
         
 
-def recommended_search(numbers:str, max_out:int=100, gpt:str='distilgpt2', beam_size:int=50, 
-                       vocab_limit:int=20, blank_vocab:int=0, word_penalty:float=0.3, 
-                       char_penalty:float=0):
+def recommended_search(numbers:str, max_out:int=100, gpt:str='distilgpt2', vocab_limit:int=25, blank_vocab:int=3, **kwargs):
     scorer = SentenceScorer(gpt)
     mnemonic_dict = json.load(open("mnemonic-dict.json","rt"))
     reduced_dict = shrink_dict(mnemonic_dict, vocab_limit)
-    bs = BeamSearcher(numbers, reduced_dict,  beam_size, scorer, word_penalty, char_penalty, blank_vocab)
+    bs = BeamSearcher(numbers, reduced_dict, scorer, blank_vocab=blank_vocab, **kwargs)
     out = bs.run(max_out=max_out)
     return out
 
@@ -287,6 +328,10 @@ def parse_args():
         type=float,
         default=0.1,
         help='How much to discourage phrases with lots of characters. Try -1ish to 1ish. Larger means shorter phrases.')
+    parser.add_argument('-dp', '--diversity_penalty',
+        type=float,
+        default=10,
+        help='How strongly to encourage diversity in the beam (perplexity/word).')
     parser.add_argument('-v', '--vocab_limit',
         type=int,
         default=25,
