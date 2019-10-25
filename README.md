@@ -4,7 +4,7 @@ The [mnemonic major system](https://en.wikipedia.org/wiki/Mnemonic_major_system)
 
 The basics of the code are that each number corresponds to a consonant sound, e.g. "3" corresponds to "M", "1" corresponds to "S" or "T" or "TH", and "4" corresponds to "R".  I learned about this system from one of my college math professors, [Dr. Arthur Benjamin](https://math.hmc.edu/benjamin/), who uses it to, among other things, remember intermediate results when performing "mathemagician" tricks like [multiplying 5-digit numbers in his head](https://www.ted.com/talks/arthur_benjamin_does_mathemagic?language=en#t-819057).  To dive into this, I highly recommend his book, [Secrets of Mental Math](https://www.amazon.com/Secrets-Mental-Math-Mathemagicians-Calculation/dp/0307338401).
 
-This code uses a neural-network transformer-based language model (GPT2) from [Huggingface](https://huggingface.co/transformers/) to discriminate between high-quality phrases and low-quality phrases that correspond to any number you provide.  The correspondance isn't perfect, because this code uses letters, while the proper mnemonic is based in pronunciation, and English's spelling/pronunciation is highly irregular.
+This code uses a neural-network transformer-based language model (GPT2) from [Huggingface](https://huggingface.co/transformers/) to discriminate between high-quality phrases and low-quality phrases that correspond to any number you provide.  A complete search over possibilities is exponentially expensive, so this uses beam-search to make the runtime linear, with many configurable parameters to trade-off how it searches.
 
 
 ## Usage
