@@ -33,9 +33,9 @@ class NextBeamDataset(torch.utils.data.IterableDataset):
     """
 
     def __init__(self, numbers:str, mnd:dict, blank_vocab:int=0):
-        self.beam = [('', numbers)]
+        self.beam = [('', numbers)]  # Init with blank entry.
         self.next_beam = []
-        self.mnd = mnd
+        self.mnd = mnd  # the MNemonic Dictionary
         self.longest_num = max(set([len(nums) for nums in self.mnd.keys()]))
         self.blank_vocab = blank_vocab
 
@@ -290,6 +290,20 @@ class BeamSearcher():
             display_score = rec.get('base_score', score)
             print(f"{display_score: 8.2f} (#{rec.get('old_rank','#'): 3d}) {rec['phrase']}")
 
+
+class DiverseBeamSearcher(BeamSearcher):
+    """Implements the "diverse beam search" algorithm
+    """
+
+    def __init__(self, peers: [BeamSearcher], *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.peers = peers
+
+    def calc_score(self, candidate:dict) -> float:
+        base_score = super().calc_score(candidate)
+
+
+
 def shrink_dict(mnemonic_dict:dict, vocab_limit:int) -> dict:
     """Takes a dict which maps numberstr -> List[word-strings], and
     limits each value so that it has at most vocab_limit entries.  If the dict
@@ -346,7 +360,7 @@ def parse_args():
         help='Maximum number of phrases to display at end.')
     parser.add_argument('--gpt',
         default='distilgpt2',
-        choices=['distilgpt2', 'gpt2', 'gpt2-medium', 'gpt2-large', 'check-if-huggingface-added-more'],
+        choices=['distilgpt2', 'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl', 'check-if-huggingface-added-more'],
         help='Which pre-trained GPT2 model to use to judge phrase quality')
     return parser.parse_args()
 
